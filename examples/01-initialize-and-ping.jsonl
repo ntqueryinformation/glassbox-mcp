@@ -1,0 +1,4 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"opencode","version":"1.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ping","arguments":{}}}
+{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"ok\":true,\"driver\":\"resident (\\\\\\\\.\\\\GlassBox open)\",\"kernel_read_smoke\":\"PASS (MZ)\",\"self_pid\":13520,\"self_base\":\"0x7FF6F5A20000\",\"writes_enabled\":false}"}]}}

@@ -1,0 +1,7 @@
+bin/
+obj/
+.vs/
+*.user
+*.log
+t2_*.json
+watch_*.json
