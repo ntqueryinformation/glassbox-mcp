@@ -151,6 +151,7 @@ the `GLASSBOX_ALLOW_WRITE=1` environment variable on the server process **and**
 |---|---|
 | Read tools (read / hexdump / scan / enum / watch / find_string) | ungated — passive analysis |
 | Write tools (`alloc`, `protect`, `write_*`) | require `GLASSBOX_ALLOW_WRITE=1` env **AND** `"confirm": true` per call; every write verifies by read-back |
+| Address validation | every address, range, pointer-chain step, and dereferenced value is checked against user space (`0x10000`..`0x7FFFFFFFEFFFF`) **before** any IOCTL — kernel-canonical garbage that would crash a KernelMode-copy driver is rejected cleanly instead |
 | Context safety | read cap 256 KiB/call, hexdump cap 16 KiB, string cap 4 KiB, scan cap 1 GiB, chain depth 16, batch/watch item caps |
 | Failure mode | every tool returns `{ok, error}` JSON in-band — never crashes, never loads anything, missing-driver is a clean message with the Win32 error code |
 
@@ -245,6 +246,8 @@ or `<project>/.opencode/skills/glassbox-re/` (project-local), then reload.
 |---|---|
 | `cannot open device \\.\GlassBox` + Win32 error 2 | Device not found — your driver isn't loaded, or its device name differs. Set `GLASSBOX_DEVICE` to match. A reboot also unloads manually-loaded drivers. |
 | Same error + Win32 error 5 | Device exists but access is denied — the host terminal isn't elevated. Restart the agent host from an admin shell. |
+| `address 0x... is outside user space - rejected` | The validation gate caught a kernel-canonical/garbage address (usually a stale pointer or misparsed value). Don't retry it — re-derive the address one step earlier. |
+| `chain stopped at step N: deref @ ... outside user space` | The pointer chain dereferenced into garbage. Stop following that chain; re-validate the last good link. |
 | `READ ioctl failed @ 0x...` | Unreadable/freed address, or wrong pid. |
 | `writes are disabled` | Set `GLASSBOX_ALLOW_WRITE=1` in the server env and reconnect. |
 | `Toolhelp module snapshot failed` | Protected/short-lived process — use `module_base` (kernel path) instead. |

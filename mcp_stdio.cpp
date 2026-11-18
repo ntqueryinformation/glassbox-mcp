@@ -59,7 +59,7 @@ using json = nlohmann::json;
 // Constants / caps -- keep tool output sane for LLM context windows.
 // ----------------------------------------------------------------------------
 static constexpr const char* kServerName    = "glassbox-mcp";
-static constexpr const char* kServerVersion = "1.1.0";
+static constexpr const char* kServerVersion = "1.2.0";
 static constexpr const char* kDefaultProto  = "2025-06-18";
 
 static constexpr size_t   kMaxReadBytes  = 256 * 1024;    // read tool cap
@@ -71,6 +71,14 @@ static constexpr size_t   kMaxChainDepth = 16;            // pointer chain max
 static constexpr size_t   kMaxPatternLen = 256;           // AOB pattern cap
 static constexpr size_t   kMaxProcRows   = 512;           // process_list cap
 static constexpr size_t   kMaxModuleRows = 1024;          // module_list cap
+
+// User-space bounds (crash prevention). A driver that copies with KernelMode
+// requestor mode skips address probing: a kernel-canonical address reaches raw
+// memcpy inside Mm and bugchecks 0x50. Unmapped USER addresses fail cleanly
+// as NTSTATUS, so every address we send must be inside [kUserMin, kUserMax]
+// and ranges must not wrap past kUserMax.
+static constexpr uint64_t kUserMin = 0x0000000000010000ull;
+static constexpr uint64_t kUserMax = 0x00007FFFFFFEFFFFull;
 
 // ----------------------------------------------------------------------------
 // stderr logging + stdout protocol emit
@@ -210,6 +218,29 @@ static bool json_to_i64(const json& j, int64_t& out) {
 static bool json_get_addr(const json& args, const char* key, uint64_t& out, std::string& err) {
     if (!args.contains(key) || args[key].is_null()) { err = std::string("missing argument: ") + key; return false; }
     if (!json_to_u64(args[key], out)) { err = std::string("bad ") + key + " (expected hex string like \"0x7FF6A5B00000\" or a number)"; return false; }
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// User-space address validation (crash prevention). A driver that copies with
+// KernelMode requestor mode skips probing: kernel-canonical addresses (e.g.
+// "0xFFFFFFFFFFFFFFEB" - usually a garbage deref) reach raw memcpy inside Mm
+// and bugcheck. Unmapped USER addresses fail cleanly as NTSTATUS. Reject
+// early, with an explanation the agent can act on.
+// ----------------------------------------------------------------------------
+static bool user_addr_ok(uint64_t addr, uint64_t size, std::string& err) {
+    if (addr < kUserMin || addr > kUserMax) {
+        err = "address " + hexs(addr) + " is outside user space - rejected. Kernel-canonical "
+              "addresses crash the driver; this address is usually a garbage deref, not a real pointer.";
+        return false;
+    }
+    if (size > 0) {
+        uint64_t end = addr + size - 1;
+        if (end < addr || end > kUserMax) {
+            err = "range " + hexs(addr) + " + " + hexs(size) + " bytes leaves user space";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -597,6 +628,7 @@ static json h_read(const json& args) {
         std::snprintf(e, sizeof(e), "size %zu exceeds cap %zu per call", size, kMaxReadBytes);
         return errj(e);
     }
+    if (!user_addr_ok(addr, size, err)) return errj(err);
     if (!ensure_driver(err)) return errj(err);
     std::vector<uint8_t> buf(size);
     if (!glassbox::ReadProcessMemory(pid, addr, buf.data(), size))
@@ -637,6 +669,7 @@ static json h_hexdump(const json& args) {
         std::snprintf(e, sizeof(e), "size %zu exceeds hexdump cap %zu per call", size, kMaxHexdump);
         return errj(e);
     }
+    if (!user_addr_ok(addr, size, err)) return errj(err);
     if (!ensure_driver(err)) return errj(err);
     std::vector<uint8_t> buf(size);
     if (!glassbox::ReadProcessMemory(pid, addr, buf.data(), size))
@@ -685,6 +718,7 @@ static json h_read_value(const json& args) {
         if (t == VT::INVALID) return errj("bad type: use u8 u16 u32 u64 i8 i16 i32 i64 float double bool pointer");
     }
     if (!ensure_driver(err)) return errj(err);
+    if (!user_addr_ok(addr, vtype_size(t), err)) return errj(err);
     json value;
     if (!read_typed(pid, addr, t, value, err)) return errj(err);
     json r = json::object();
@@ -718,21 +752,41 @@ static json h_read_chain(const json& args) {
         if (t == VT::INVALID) return errj("bad type");
     }
     if (!ensure_driver(err)) return errj(err);
+    if (!user_addr_ok(base, 0, err)) return errj(err);
 
     uint64_t addr = base;
     json chain = json::array();
     for (size_t i = 0; i + 1 < off.size(); ++i) {
+        uint64_t probe = addr + (uint64_t)off[i];
+        if (!user_addr_ok(probe, 8, err)) {
+            err += " (chain step " + std::to_string(i) + ": base+offset walked outside user space)";
+            return errj(err);
+        }
         uint64_t next = 0;
-        if (!glassbox::Read<uint64_t>(pid, addr + (uint64_t)off[i], next) || !next) {
+        if (!glassbox::Read<uint64_t>(pid, probe, next) || !next) {
             char e[200];
             std::snprintf(e, sizeof(e), "chain broken at step %zu: could not read pointer @ %s (base+offsets[0..%zu])",
-                          i, hexs(addr + (uint64_t)off[i]).c_str(), i);
+                          i, hexs(probe).c_str(), i);
+            return errj(e);
+        }
+        // A dereferenced value becomes the next address. If it is kernel-canonical
+        // or trivially bogus, stop BEFORE using it - this is exactly how garbage
+        // (misinterpreted floats, failed derefs) used to become crashes.
+        if (next < kUserMin || next > kUserMax) {
+            char e[240];
+            std::snprintf(e, sizeof(e), "chain stopped at step %zu: deref @ %s read 0x%llX which is outside user "
+                                         "space - the chain is following garbage, not a real pointer",
+                          i, hexs(probe).c_str(), (unsigned long long)next);
             return errj(e);
         }
         addr = next;
         chain.push_back(hexs(addr));
     }
     uint64_t final_addr = addr + (uint64_t)off.back();
+    if (!user_addr_ok(final_addr, vtype_size(t), err)) {
+        err += " (final chain address)";
+        return errj(err);
+    }
     json value;
     if (!read_typed(pid, final_addr, t, value, err)) return errj(err);
     json r = json::object();
@@ -761,6 +815,7 @@ static json h_read_string(const json& args) {
     if (max_len > kMaxStringLen) max_len = kMaxStringLen;
     std::string enc = args.value("encoding", "ascii");
     if (!ensure_driver(err)) return errj(err);
+    if (!user_addr_ok(addr, max_len, err)) return errj(err);
 
     std::string text;
     if (enc == "utf16" || enc == "unicode" || enc == "wide") {
@@ -792,7 +847,7 @@ static json hits_to_json(DWORD pid, const std::vector<uint64_t>& hits,
         if (context) {
             std::vector<uint8_t> cb(context * 2);
             uint64_t cs = h >= (uint64_t)context ? h - context : 0;
-            if (glassbox::ReadProcessMemory(pid, cs, cb.data(), cb.size())) {
+            if (cs >= kUserMin && glassbox::ReadProcessMemory(pid, cs, cb.data(), cb.size())) {
                 std::string hex;
                 for (size_t i = 0; i < cb.size(); ++i) {
                     std::snprintf(b, sizeof(b), "%02X ", cb[i]);
@@ -868,6 +923,7 @@ static json h_scan(const json& args) {
     int64_t v; if (!json_to_i64(args.at("size"), v) || v <= 0) return errj("bad size");
     size = (size_t)v;
     if (size > kMaxScanRange) return errj("size exceeds 1 GiB cap");
+    if (!user_addr_ok(start, size, err)) return errj(err);
     if (!args.contains("pattern") || !args.at("pattern").is_string())
         return errj("missing argument: pattern (IDA-style, e.g. \"48 8B 0D ?? ?? ?? ??\")");
     std::string pattern = args.at("pattern").get<std::string>();
@@ -975,6 +1031,7 @@ static json h_protect(const json& args) {
     ULONG protect = 0;
     if (!args.contains("protect")) return errj("missing argument: protect");
     if (!parse_protect(args.at("protect"), protect, err)) return errj(err);
+    if (!user_addr_ok(addr, (size_t)v, err)) return errj(err);
     if (!ensure_driver(err)) return errj(err);
 
     if (!glassbox::ProtectMemory(pid, addr, (size_t)v, protect))
@@ -1028,6 +1085,7 @@ static json h_write_bytes(const json& args) {
         std::snprintf(e, sizeof(e), "payload %zu bytes exceeds cap %zu", bytes.size(), kMaxWriteBytes);
         return errj(e);
     }
+    if (!user_addr_ok(addr, bytes.size(), err)) return errj(err);
     if (!ensure_driver(err)) return errj(err);
 
     if (!glassbox::WriteBytes(pid, addr, bytes))
@@ -1067,6 +1125,7 @@ static json h_write_value(const json& args) {
     if (t == VT::INVALID) return errj("bad type");
     if (!args.contains("value")) return errj("missing argument: value");
     if (!ensure_driver(err)) return errj(err);
+    if (!user_addr_ok(addr, vtype_size(t), err)) return errj(err);
 
     if (!write_typed(pid, addr, t, args.at("value"), err)) return errj(err);
     // verify by read-back
@@ -1094,19 +1153,23 @@ static json h_write_string(const json& args) {
     if (text.size() > kMaxWriteBytes) return errj("text too long");
     std::string enc = args.value("encoding", "ascii");
     bool include_null = args.value("include_null", true);
+    if (enc != "ascii" && enc != "utf8" && enc != "ansi" &&
+        enc != "utf16" && enc != "unicode" && enc != "wide")
+        return errj("encoding must be \"ascii\" or \"utf16\"");
     if (!ensure_driver(err)) return errj(err);
 
-    bool ok;
+    // Pre-compute the write length so validation covers the full range.
+    bool wide = (enc == "utf16" || enc == "unicode" || enc == "wide");
     size_t written;
-    if (enc == "utf16" || enc == "unicode" || enc == "wide") {
-        std::wstring w = utf8_to_wide(text);
-        written = (w.size() + (include_null ? 1 : 0)) * 2;
-        ok = glassbox::WriteWString(pid, addr, w, include_null);
-    } else if (enc == "ascii" || enc == "utf8" || enc == "ansi") {
-        written = text.size() + (include_null ? 1 : 0);
-        ok = glassbox::WriteString(pid, addr, text, include_null);
+    if (wide) written = (utf8_to_wide(text).size() + (include_null ? 1 : 0)) * 2;
+    else      written = text.size() + (include_null ? 1 : 0);
+    if (!user_addr_ok(addr, written, err)) return errj(err);
+
+    bool ok;
+    if (wide) {
+        ok = glassbox::WriteWString(pid, addr, utf8_to_wide(text), include_null);
     } else {
-        return errj("encoding must be \"ascii\" or \"utf16\"");
+        ok = glassbox::WriteString(pid, addr, text, include_null);
     }
     if (!ok) return errj("WRITE ioctl failed @ " + hexs(addr));
     json r = json::object();
@@ -1208,6 +1271,7 @@ static json h_find_string(const json& args) {
     }
 
     std::vector<uint64_t> hits;
+    if (!user_addr_ok(start, size, err)) return errj(err);
     FindLiteralAll(pid, start, size, pat, fold, max_results, hits);
     json r = json::object();
     r["ok"] = true;
@@ -1262,6 +1326,13 @@ static json h_read_many(const json& args) {
             ++errc;
             continue;
         }
+        if (!user_addr_ok(addr, vtype_size(t), err)) {
+            row["ok"] = false;
+            row["error"] = err;
+            results.push_back(row);
+            ++errc;
+            continue;
+        }
         json value;
         if (read_typed(pid, addr, t, value, err)) {
             row["ok"] = true;
@@ -1301,6 +1372,7 @@ static json h_read_struct(const json& args) {
     if (args.contains("type") && args.at("type").is_string())
         default_type = args.at("type").get<std::string>();
     if (!ensure_driver(err)) return errj(err);
+    if (!user_addr_ok(base, 0, err)) return errj(err);
 
     json rows = json::array();
     size_t okc = 0, errc = 0;
@@ -1324,6 +1396,13 @@ static json h_read_struct(const json& args) {
         if (t == VT::INVALID) {
             row["ok"] = false;
             row["error"] = "bad type: " + tname;
+            rows.push_back(row);
+            ++errc;
+            continue;
+        }
+        if (!user_addr_ok(addr, vtype_size(t), err)) {
+            row["ok"] = false;
+            row["error"] = err;
             rows.push_back(row);
             ++errc;
             continue;
@@ -1391,6 +1470,8 @@ static json h_watch(const json& args) {
         } else if (t == VT::INVALID) {
             return errj("bad default type");
         }
+        std::string aerr;
+        if (!user_addr_ok(a, vtype_size(t), aerr)) return errj(aerr);
         items.push_back({ a, t });
     }
 

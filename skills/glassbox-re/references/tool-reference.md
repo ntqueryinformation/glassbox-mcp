@@ -1,9 +1,10 @@
-# GlassBox MCP — Full Tool Reference (21 tools, v1.1.0)
+# GlassBox MCP — Full Tool Reference (21 tools, v1.2.0)
 
 Universal conventions:
 
 - Target: every tool takes `pid` (integer) OR `process_name` (case-insensitive substring, must be unique).
 - Addresses: hex strings (`"0x7FF604270000"`) or numbers in; 64-bit results OUT as hex strings (JSON precision).
+- Address validation: every address (and address+size range, incl. write length and pointer-chain steps) must land in user space (`0x10000`..`0x7FFFFFFFEFFFF`). Out-of-range or wrapping values are rejected client-side with a clean `{ok:false}` — they never reach the driver, because kernel-canonical garbage derefs bugcheck typical drivers.
 - Errors: `{ok: false, error: "guidance"}` + MCP `isError: true`. Nothing throws.
 - Caps: read 256 KiB · hexdump 16 KiB · string 4096 chars · scan 1 GiB · chain depth 16 · write payload 64 KiB · batch items 64 · watch 16 items / 32 samples / 8 s window.
 
@@ -68,6 +69,9 @@ Pattern syntax: IDA-style, `"48 8B 0D ?? ?? ?? ??"` (`?`/`??` = wildcard byte).
 |---|---|
 | `cannot open device \\.\X` + Win32 err 2 | device not found — driver not loaded (a reboot unloads it) or wrong name → set `GLASSBOX_DEVICE` to match |
 | same + Win32 err 5 | device exists, token not admin → restart OpenCode elevated (`opencode service restart` from admin terminal) |
+| `address 0x... is outside user space - rejected` | validation gate: kernel-canonical/garbage address — a stale deref or misparsed value; do NOT retry it, go back one step and re-derive the address |
+| `range 0x... + N bytes leaves user space` | start was fine but the read/write/scan runs past the user-space ceiling — shrink the size |
+| `chain stopped at step N: deref @ ... outside user space` | the chain dereferenced into garbage — stop following it; re-validate the previous link instead of pushing on |
 | `READ ioctl failed @ 0x...` | unreadable/freed address, wrong pid, or protected process |
 | `chain broken at step N` | pointer dead at that link — back up one step, re-validate |
 | `writes are disabled` | env var missing on the server — user must set it in config |
